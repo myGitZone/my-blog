@@ -944,3 +944,467 @@ function ensureRootIsScheduled(root: FiberRoot, currentTime: number) {
 ```
 
 判断新任务的优先级是否是同步优先级，是则使用同步渲染模式，否则使用并发渲染模式使用scheduler调度任务, 在使用并发模式时，会将lane的优先级转换为React事件的优先级，然后再根据React事件的优先级转换为Scheduler的优先级，Scheduler会根据它自己的优先级给任务做时间分片。
+
+
+## 任务执行时Lane是如何工作的
+当Scheduler开始任务调度，会循环taskQueue执行任务（详细请看[1-React源码解析之Scheduler](./1-React源码解析之Scheduler.md)），那么便会执行performConcurrentWorkOnRoot函数。
+```javascript
+function performConcurrentWorkOnRoot(root, didTimeout) {
+  ...
+  
+  // 从所有待执行的任务中，找出优先级最高的任务
+  let lanes = getNextLanes(
+    root,
+    root === workInProgressRoot ? workInProgressRootRenderLanes : NoLanes,
+  );
+  if (lanes === NoLanes) {
+    // Defensive coding. This is never expected to happen.
+    return null;
+  }
+
+  // shouldTimeSlice函数根据lane的优先级，决定是使用并发模式还是同步模式渲染(解决饥饿问题)
+  // didTimeout判断当前任务是否是超时
+  let exitStatus =
+    shouldTimeSlice(root, lanes) &&
+    (disableSchedulerTimeoutInWorkLoop || !didTimeout)
+      ? renderRootConcurrent(root, lanes)
+      : renderRootSync(root, lanes);
+  ...
+  return null;
+}
+```
+可以看到在这个函数中又调用了一次getNextLanes方法，为什么这边又要调用一次？结合上下文来分析，在执行任务前，可能又产生了一个新的任务，
+这个新的任务的优先级如果比将要执行的任务的优先级低，则不管继续渲染，但是如果比将要执行的任务的优先级高，那么则需要先执行这个优先级高的任务。
+在每次执行任务的时候调用getNextLanes方法，就是为了在任何时候都要保证执行的任务是优先级最高的。
+
+### 解决任务饥饿问题
+
+```javascript
+let exitStatus =
+    shouldTimeSlice(root, lanes) &&
+    (disableSchedulerTimeoutInWorkLoop || !didTimeout)
+      ? renderRootConcurrent(root, lanes)
+      : renderRootSync(root, lanes);
+```
+这个判断就是解决任务饥饿问题的关键。
+
+didTimeout表示当前任务是否过期，如果过期则会进入同步模式执行。
+
+接着我们来看一下shouldTimeSlice函数。
+```javascript
+export function shouldTimeSlice(root: FiberRoot, lanes: Lanes) {
+
+  // 检查当前任务的lane是否在已过期的lanes中
+  // 如果在，则为了防止饥饿问题，则会返回false，执行同步渲染
+  if ((lanes & root.expiredLanes) !== NoLanes) {
+    return false;
+  }
+
+  // 检查当前是否开启并发模式和当前使用的渲染模式是否是并发模式
+  // 如果是则返回true，使用并发渲染
+  if (
+    allowConcurrentByDefault &&
+    (root.current.mode & ConcurrentUpdatesByDefaultMode) !== NoMode
+  ) {
+    return true;
+  }
+
+  // 检查当前lane是否与SyncDefaultLanes有交集
+  // 如果有，则会启用同步渲染模式 ，反之则使用并发模式渲染
+  // InputContinuousHydrationLane  InputContinuousLane  DefaultHydrationLane  DefaultLane
+  // 这四个lane都是需要使用同步模式执行的
+  const SyncDefaultLanes =
+    InputContinuousHydrationLane |
+    InputContinuousLane |
+    DefaultHydrationLane |
+    DefaultLane;
+
+  return (lanes & SyncDefaultLanes) === NoLanes;
+}
+
+```
+记得我们之前在说过关于任务饥饿问题的处理，主要逻辑在markStarvedLanesAsExpired函数中，它主要的作用是为当前任务根据优先级添加过期时间，并检查未执行的任务中是否有任务过期，有任务过期则在expiredLanes中添加该任务的lane，在后续该任务的执行中以同步模式执行，避免饥饿问题。
+
+在shouldTimeSlice中会检查当前任务的lane是否在已过期的expiredLanes中，如果在，则为了防止饥饿问题，则会返回false，执行同步渲染。
+
+如果不在，表示当前任务没有过期，则会再检查当前是否开启并发模式和当前使用的渲染模式是否是并发模式：
+```javascript
+if (
+    allowConcurrentByDefault &&
+    (root.current.mode & ConcurrentUpdatesByDefaultMode) !== NoMode
+  ) {
+    return true;
+  }
+
+```
+满足条件则返回true，使用并发模式。
+
+如果不满足，则会检查当前lane是否与SyncDefaultLanes有交集：
+```javascript
+const SyncDefaultLanes =
+    InputContinuousHydrationLane |
+    InputContinuousLane |
+    DefaultHydrationLane |
+    DefaultLane;
+    
+return (lanes & SyncDefaultLanes) === NoLanes;
+
+```
+SyncDefaultLanes中的四个lane都是使用同步渲染模式执行的，如果当前lane与这个四个中的一个一样，那么则会启用同步渲染模式 ，反之则使用并发模式渲染。
+
+当任务使用同步模式执行时是无法被打断的，直到执行完成。那么任务饥饿问题也相应的被解决了。
+
+我们默认使用concurrent模式来执行任务。
+
+### 状态更新
+使用concurrent模式执行任务，接下来便会执行renderRootConcurrent：
+```javascript
+function renderRootConcurrent(root: FiberRoot, lanes: Lanes) {
+  ...
+  prepareFreshStack(root, lanes);
+
+  do {
+    try {
+      workLoopConcurrent();
+      break;
+    } catch (thrownValue) {
+      handleError(root, thrownValue);
+    }
+  } while (true);
+ ...
+
+```
+这个函数中，我们主要看两个地方，一个是prepareFreshStack方法，一个是workLoopConcurrent函数。
+
+我们先来看prepareFreshStack方法：
+```javascript
+function prepareFreshStack(root: FiberRoot, lanes: Lanes) {
+  root.finishedWork = null;
+  root.finishedLanes = NoLanes;
+
+  ...
+  workInProgressRoot = root;
+  workInProgress = createWorkInProgress(root.current, null);
+  workInProgressRootRenderLanes = subtreeRenderLanes = workInProgressRootIncludedLanes = lanes;
+  ...
+  workInProgressRootSkippedLanes = NoLanes;
+  workInProgressRootUpdatedLanes = NoLanes;
+  workInProgressRootPingedLanes = NoLanes;
+
+}
+
+```
+这个方法的主要作用是创建workInProgress树:
+```javascript
+workInProgress = createWorkInProgress(root.current, null);
+
+```
+接着将当前任务的优先级赋值给workInProgressRootRenderLanes、subtreeRenderLanes、workInProgressRootIncludedLanes这三个变量。
+
+workInProgressRootRenderLanes表示当前是否有任务正在执行，有值则表示有任务正在执行，反之则没有任务在执行。
+
+subtreeRenderLanes表示需要更新的fiber节点的lane的集合，在后面更新fiber节点的时候会根据这个值判断是否需要更新。
+
+接着便进入遍历fiber树，更新fiber节点的步骤：
+```javascript
+  workLoopConcurrent();
+          |
+          v
+  performUnitOfWork(workInProgress);
+
+```
+
+workLoopConcurrent函数主要是调用了performUnitOfWork函数，我们直接看performUnitOfWork函数：
+```javascript
+function performUnitOfWork(unitOfWork: Fiber): void {
+ ...
+  const current = unitOfWork.alternate;
+ ...
+  let next;
+  next = beginWork(current, unitOfWork, subtreeRenderLanes);
+ ...
+  unitOfWork.memoizedProps = unitOfWork.pendingProps;
+  if (next === null) {
+    completeUnitOfWork(unitOfWork);
+  } else {
+    workInProgress = next;
+  }
+  ...
+  ReactCurrentOwner.current = null;
+}
+
+```
+performUnitOfWork函数中调用了beginWork函数，beginWork函数的作用就是判断当前fiber节点是否需要更新：
+```javascript
+
+function beginWork(
+  current: Fiber | null,
+  workInProgress: Fiber,
+  renderLanes: Lanes,
+): Fiber | null {
+    ...
+    if (current !== null) {
+    const oldProps = current.memoizedProps;
+    const newProps = workInProgress.pendingProps;
+    // didReceiveUpdate  表示是否有新的props更新，有则会设置为true，没有则是false
+    if (
+      oldProps !== newProps ||
+      hasLegacyContextChanged() ||
+      (__DEV__ ? workInProgress.type !== current.type : false)
+    ) {
+      didReceiveUpdate = true;
+    } else {
+      // checkScheduledUpdateOrContext函数检查当前fiber节点上的lanes是否存在于renderLanes中
+      // 存在则说明当前fiber节点需要更新，不存在则不需要更新则复用之前的节点
+      const hasScheduledUpdateOrContext = checkScheduledUpdateOrContext(
+        current,
+        renderLanes,
+      );
+      if (
+        !hasScheduledUpdateOrContext &&
+        (workInProgress.flags & DidCapture) === NoFlags
+      ) {
+        // No pending updates or context. Bail out now.
+        didReceiveUpdate = false;
+        // 复用之前的节点
+        return attemptEarlyBailoutIfNoScheduledUpdate(
+          current,
+          workInProgress,
+          renderLanes,
+        );
+      }
+      if ((current.flags & ForceUpdateForLegacySuspense) !== NoFlags) {
+        didReceiveUpdate = true;
+      } else {
+        didReceiveUpdate = false;
+      }
+    }
+  } else {
+    didReceiveUpdate = false;
+  }
+  ...
+}
+
+```
+我们先看这段代码，先是判断了当前fiber上老的props与新的props是否相同，不相同则需要更新，则不需要判断当前fiber节点上的lanes是否在renderLanes上，相同表示不需要更新，则调用checkScheduledUpdateOrContext方法来判断是否需要更新：
+```javascript
+function checkScheduledUpdateOrContext(
+  current: Fiber,
+  renderLanes: Lanes,
+): boolean {
+  const updateLanes = current.lanes;
+  if (includesSomeLane(updateLanes, renderLanes)) {
+    return true;
+  }
+ 
+  if (enableLazyContextPropagation) {
+    const dependencies = current.dependencies;
+    if (dependencies !== null && checkIfContextChanged(dependencies)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+```
+可以看到checkScheduledUpdateOrContext方法中判断updateLanes和renderLanes是否有交集，如果有则返回true，没有则返回false。
+
+回过头我们再往下看，当checkScheduledUpdateOrContext返回false，表示不需要更新，则会调用attemptEarlyBailoutIfNoScheduledUpdate函数复用之前的节点。
+
+返回true则会根据当前fiber节点上的tag判断组件是什么类型，我们以ClassComponent为例：
+```javascript
+switch (workInProgress.tag) {
+    ...
+    case ClassComponent: {
+      const Component = workInProgress.type;
+      const unresolvedProps = workInProgress.pendingProps;
+      const resolvedProps =
+        workInProgress.elementType === Component
+          ? unresolvedProps
+          : resolveDefaultProps(Component, unresolvedProps);
+      return updateClassComponent(
+        current,
+        workInProgress,
+        Component,
+        resolvedProps,
+        renderLanes,
+      );
+    }
+    ...
+}
+
+```
+接着会执行updateClassComponent方法，这里我们就不详细解析了，把这些都放到fiber解析的时候再写。
+
+进入updateClassComponent方法后，因为我们是做的更新操作所以会调用updateClassInstance方法：
+
+```javascript
+function updateClassComponent(
+  current: Fiber | null,
+  workInProgress: Fiber,
+  Component: any,
+  nextProps: any,
+  renderLanes: Lanes,
+) {
+    ...
+    shouldUpdate = updateClassInstance(
+      current,
+      workInProgress,
+      Component,
+      nextProps,
+      renderLanes,
+    );
+    ...
+}
+
+```
+updateClassInstance方法主要是做了根据更新对象上的lane判断是否需要做更新状态，以及调用一些渲染前的生命周期：getDerivedStateFromProps，componentWillUpdate等。
+
+那我们来看一下管lane的部分，是如何做更新判断的。
+
+在updateClassInstance中会调用一个叫processUpdateQueue的方法, 我们来看一下关于lane的部分：
+```javascript
+export function processUpdateQueue<State>(
+  workInProgress: Fiber,
+  props: any,
+  instance: any,
+  renderLanes: Lanes,
+): void {
+    ...
+    let update = firstBaseUpdate;
+    do {
+      const updateLane = update.lane;
+      const updateEventTime = update.eventTime;
+      // 判断更新对象上挂载的lane是否在renderLanes上，如果在，则表明当前更新对象需要做更新操作
+      // 如果不在，则说明不需要，则直接重用跳过该更新对象
+      if (!isSubsetOfLanes(renderLanes, updateLane)) {
+        const clone: Update<State> = {
+          eventTime: updateEventTime,
+          lane: updateLane,
+
+          tag: update.tag,
+          payload: update.payload,
+          callback: update.callback,
+
+          next: null,
+        };
+        if (newLastBaseUpdate === null) {
+          newFirstBaseUpdate = newLastBaseUpdate = clone;
+          newBaseState = newState;
+        } else {
+          newLastBaseUpdate = newLastBaseUpdate.next = clone;
+        }
+        newLanes = mergeLanes(newLanes, updateLane);
+      } else {
+        if (newLastBaseUpdate !== null) {
+          const clone: Update<State> = {
+            eventTime: updateEventTime,
+            lane: NoLane,
+
+            tag: update.tag,
+            payload: update.payload,
+            callback: update.callback,
+
+            next: null,
+          };
+          newLastBaseUpdate = newLastBaseUpdate.next = clone;
+        }
+        newState = getStateFromUpdate(
+          workInProgress,
+          queue,
+          update,
+          newState,
+          props,
+          instance,
+        );
+        const callback = update.callback;
+        if (
+          callback !== null &&
+          update.lane !== NoLane
+        ) {
+          workInProgress.flags |= Callback;
+          const effects = queue.effects;
+          if (effects === null) {
+            queue.effects = [update];
+          } else {
+            effects.push(update);
+          }
+        }
+      }
+      update = update.next;
+      if (update === null) {
+        pendingQueue = queue.shared.pending;
+        if (pendingQueue === null) {
+          break;
+        } else {
+          const firstPendingUpdate = ((lastPendingUpdate.next: any): Update<State>);
+          lastPendingUpdate.next = null;
+          update = firstPendingUpdate;
+          queue.lastBaseUpdate = lastPendingUpdate;
+          queue.shared.pending = null;
+        }
+      }
+    } while (true);
+    ...
+}
+
+```
+这段代码主要是在循环取出当前fiber节点上的updateQueue中的更新对象，然后根据更新对象上挂载的lane与renderLanes比较，判断更新对象上的lane是否存在于renderLanes上，如果存在，则表示当前更新对象需要更新，如果不存在，则会重用之前的状态，跳过该更新对象。
+
+### 消耗lane
+当循环遍历完workInProgress树，那么则开始进入commit阶段，我们来看一下关键的代码：
+```javascript
+function commitRootImpl(root, renderPriorityLevel) {
+  ...
+  let remainingLanes = mergeLanes(finishedWork.lanes, finishedWork.childLanes);
+  markRootFinished(root, remainingLanes);
+  ...
+}
+
+```
+首先将finishedWork.lanes和finishedWork.childLanes进行合并操作，获取到剩下还需要做更新的lanes，然后调用markRootFinished清空掉已经执行完成的lanes的数据，将剩下的lanes重新挂载到pendingLanes上，准备下一次的执行：
+```javascript
+export function markRootFinished(root: FiberRoot, remainingLanes: Lanes) {
+  // 从pendingLanes中删除还未执行的lanes，那么就找到了已经执行过的lanes
+  const noLongerPendingLanes = root.pendingLanes & ~remainingLanes;
+
+  // 将剩下的lanes重新挂载到pendingLanes上，准备下一次的执行
+  root.pendingLanes = remainingLanes;
+
+  root.suspendedLanes = 0;
+  root.pingedLanes = 0;
+
+  // 从expiredLanes， mutableReadLanes， entangledLanes中删除掉已经执行的lanes
+  root.expiredLanes &= remainingLanes;
+  root.mutableReadLanes &= remainingLanes;
+
+  root.entangledLanes &= remainingLanes;
+
+  if (enableCache) {
+    const pooledCacheLanes = (root.pooledCacheLanes &= remainingLanes);
+    if (pooledCacheLanes === NoLanes) {
+      root.pooledCache = null;
+    }
+  }
+
+  const entanglements = root.entanglements;
+  const eventTimes = root.eventTimes;
+  const expirationTimes = root.expirationTimes;
+
+  // 取出已经执行的lane，清空它们所有的数据
+  // eventTimes中的事件触发时间，expirationTimes中的任务过期时间等
+  let lanes = noLongerPendingLanes;
+  while (lanes > 0) {
+    const index = pickArbitraryLaneIndex(lanes);
+    const lane = 1 << index;
+
+    entanglements[index] = NoLanes;
+    eventTimes[index] = NoTimestamp;
+    expirationTimes[index] = NoTimestamp;
+
+    lanes &= ~lane;
+  }
+}
+
+```
+当commit阶段完成后，当前任务执行成功，最后还会再调用一次ensureRootIsScheduled函数，目的就是为了保证remainingLanes如果不为空的话，则继续执行剩下的任务。
